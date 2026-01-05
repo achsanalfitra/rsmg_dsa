@@ -1,4 +1,3 @@
-[package]
-name = "rsmg_dsa"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = ["core", "test"]
+resolver = "3"

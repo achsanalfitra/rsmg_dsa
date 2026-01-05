@@ -3,5 +3,9 @@
 version = 4
 
 [[package]]
-name = "rsmg_dsa"
+name = "core"
+version = "0.1.0"
+
+[[package]]
+name = "test"
 version = "0.1.0"
