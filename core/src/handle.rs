@@ -109,12 +109,13 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn test_atomic_integrity_1000_threads() {
+    fn test_atomic_integrity_targeted_threads() {
+        static TARGET: usize = 1000;
         let size: usize = 0;
         let handle = Arc::new(AtomicHandle::new(size));
-        let mut workers = Vec::with_capacity(1000);
+        let mut workers = Vec::with_capacity(TARGET);
 
-        for _ in 0..1000 {
+        for _ in 0..TARGET {
             let h = Arc::clone(&handle);
             workers.push(thread::spawn(move || {
                 h.update(|val| {
@@ -130,7 +131,7 @@ mod tests {
 
         let (final_val, stamp) = handle.get();
 
-        assert_eq!(final_val, 1000);
-        assert!(stamp >= 1000, "stamp incorrect");
+        assert_eq!(final_val, TARGET);
+        assert!(stamp >= TARGET as u32, "stamp incorrect");
     }
 }
