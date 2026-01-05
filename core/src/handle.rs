@@ -45,7 +45,7 @@ impl<T> AtomicHandle<T> {
         }
     }
 
-    pub(crate) fn update<F>(&self, mut f: F)
+    pub(crate) fn update<F>(&self, mut f: F) -> T
     where
         F: FnMut(T) -> T,
         T: Copy,
@@ -71,6 +71,8 @@ impl<T> AtomicHandle<T> {
                 }
             }
         }
+
+        current_val
     }
 
     fn swap(&self, inner: T, stamp: u32) -> STATE {
@@ -133,5 +135,68 @@ mod tests {
 
         assert_eq!(final_val, TARGET);
         assert!(stamp >= TARGET as u32, "stamp incorrect");
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct TestStruct {
+        pub(crate) id: i32,
+        pub(crate) name: String,
+    }
+
+    impl TestStruct {
+        fn new(id: i32, name: String) -> Self {
+            Self { id: id, name: name }
+        }
+    }
+
+    impl Drop for TestStruct {
+        fn drop(&mut self) {
+            println!("memory freed for name: {}", self.name);
+        }
+    }
+
+    #[test]
+    fn test_pointer_manipulation() {
+        let test_object = TestStruct::new(1, "hello".to_string());
+        let ptr = Box::into_raw(Box::new(test_object));
+
+        let handle = AtomicHandle::new(ptr);
+
+        // the writer is forced to clone.
+        // This elevates the burden from AtomicHandle
+        // into the primitives that use this
+        let old_ptr = handle.update(|ptr| {
+            let mut safe_ptr = unsafe { (*ptr).clone() };
+            safe_ptr.name = "world".to_string();
+            Box::into_raw(Box::new(safe_ptr))
+        });
+
+        let (current_ptr, _stamp) = handle.get();
+
+        assert_eq!(unsafe { &current_ptr.as_ref().unwrap().name }, "world");
+
+        unsafe {
+            let _ = Box::from_raw(old_ptr);
+        } // free() dance
+    }
+
+    #[test]
+    fn test_arc_manipulation() {
+        let test_object = Arc::into_raw(Arc::new(TestStruct::new(1, "hello".to_string())));
+        let handle = AtomicHandle::new(test_object);
+
+        let old_ptr = handle.update(|old_arc| {
+            let mut new_obj = unsafe { (*old_arc).clone() };
+            new_obj.name = "world".to_string();
+
+            Arc::into_raw(Arc::new(new_obj))
+        });
+
+        let (current_arc, _) = handle.get();
+        assert_eq!(unsafe { &current_arc.as_ref().unwrap().name }, "world");
+
+        unsafe {
+            Arc::decrement_strong_count(old_ptr);
+        }
     }
 }
