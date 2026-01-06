@@ -108,7 +108,7 @@ impl<T> Drop for InnerLinkedStack<T> {
 }
 
 impl<T> LinkedStackNode<T> {
-    fn new(data: T) -> Self {
+    pub fn new(data: T) -> Self {
         Self {
             data: data,
             next: None,
