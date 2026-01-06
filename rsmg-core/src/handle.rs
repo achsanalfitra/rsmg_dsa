@@ -75,6 +75,32 @@ impl<T> AtomicHandle<T> {
         current_val
     }
 
+    pub(crate) fn update_exclusive<F>(&self, mut f: F) -> T
+    where
+        F: FnMut(T) -> T,
+        T: Copy,
+    {
+        let (mut current_val, mut current_stamp) = self.get();
+
+        loop {
+            match self.write(current_val, current_stamp, &mut f) {
+                (data, STATE::Success) => return data,
+
+                (_, STATE::Busy) => {
+                    core::hint::spin_loop();
+                    continue;
+                }
+
+                (_, STATE::Stale) => {
+                    core::hint::spin_loop();
+                    let (v, s) = self.get();
+                    current_val = v;
+                    current_stamp = s;
+                }
+            }
+        }
+    }
+
     fn swap(&self, inner: T, stamp: u32) -> STATE {
         if self.stamp.load(Ordering::Acquire) == WRITING_STATE {
             return STATE::Busy;
@@ -98,6 +124,32 @@ impl<T> AtomicHandle<T> {
         self.stamp.store(new_stamp, Ordering::Release);
 
         STATE::Success
+    }
+
+    fn write<F>(&self, inner: T, stamp: u32, mut f: F) -> (T, STATE)
+    where
+        F: FnMut(T) -> T,
+    {
+        if self.stamp.load(Ordering::Acquire) == WRITING_STATE {
+            return (inner, STATE::Busy);
+        }
+
+        let mut new_stamp = stamp.wrapping_add(1);
+        if new_stamp == WRITING_STATE {
+            new_stamp = new_stamp.wrapping_add(1);
+        }
+
+        match self
+            .stamp
+            .compare_exchange(stamp, WRITING_STATE, Ordering::AcqRel, Ordering::Relaxed)
+        {
+            Ok(_) => {
+                let new_inner = f(inner);
+                self.stamp.store(new_stamp, Ordering::Release);
+                return (new_inner, STATE::Success);
+            }
+            _ => return (inner, STATE::Stale),
+        };
     }
 }
 
