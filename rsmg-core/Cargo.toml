@@ -1,0 +1,21 @@
+[package]
+name = "rsmg-core"
+version = "0.1.0-alpha.1"
+edition = "2024"
+description = "Core atomic pointer management and concurrent data structures for the RSMG framework."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/achsanalfitra/rsmg-dsa" 
+keywords = ["atomic", "lock-free", "concurrency", "wasm", "dioxus"]
+categories = ["concurrency", "data-structures"]
+readme = "README.md"
+include = [
+    "src/**/*",
+    "README.md",
+    "../LICENSE-MIT",
+    "../LICENSE-APACHE"
+]
+
+[lib]
+name = "rsmg_core"
+path = "src/lib.rs"
+
