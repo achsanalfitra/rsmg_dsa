@@ -1,6 +1,6 @@
 use crate::handle::AtomicHandle;
 
-struct LinkedStack<T> {
+pub struct LinkedStack<T> {
     inner: AtomicHandle<*mut InnerLinkedStack<T>>,
 }
 
@@ -8,19 +8,19 @@ struct InnerLinkedStack<T> {
     head: Option<*mut LinkedStackNode<T>>,
 }
 
-struct LinkedStackNode<T> {
+pub struct LinkedStackNode<T> {
     data: T,
     next: Option<*mut LinkedStackNode<T>>,
 }
 
 impl<T> LinkedStack<T> {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             inner: AtomicHandle::new(Box::into_raw(Box::new(InnerLinkedStack::new()))),
         }
     }
 
-    fn pop(&self) -> Result<Option<T>, Box<dyn std::error::Error>> {
+    pub fn pop(&self) -> Result<Option<T>, Box<dyn std::error::Error>> {
         let mut popped_node = None;
 
         self.inner.update_exclusive(|inner| unsafe {
@@ -31,7 +31,7 @@ impl<T> LinkedStack<T> {
         Ok(popped_node)
     }
 
-    fn push(&self, node: LinkedStackNode<T>) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn push(&self, node: LinkedStackNode<T>) -> Result<(), Box<dyn std::error::Error>> {
         let node_ptr = Box::into_raw(Box::new(node));
         if node_ptr.is_null() {
             return Err("pushed null pointer".into());
