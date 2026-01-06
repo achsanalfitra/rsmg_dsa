@@ -49,6 +49,22 @@ impl<T> LinkedStack<T> {
 
         result
     }
+
+    pub fn inspect<F>(&self, mut f: F)
+    where
+        F: FnMut(&T),
+    {
+        self.inner.update_exclusive(|inner_ptr| {
+            unsafe {
+                let mut current = inner_ptr.as_ref().unwrap().head;
+                while let Some(node_ptr) = current {
+                    f(&(*node_ptr).data);
+                    current = (*node_ptr).next;
+                }
+            }
+            inner_ptr
+        });
+    }
 }
 
 impl<T> InnerLinkedStack<T> {
@@ -126,6 +142,57 @@ mod tests {
         assert_eq!(popped2, 10);
 
         assert!(stack.pop().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_inspect() {
+        let stack = LinkedStack::new();
+
+        let node1 = LinkedStackNode::new(10);
+
+        stack.push(node1).unwrap();
+
+        stack.inspect(|f| assert_eq!(f.clone(), 10));
+    }
+
+    #[test]
+    fn test_inspect_contention_hammer() {
+        let stack = Arc::new(LinkedStack::new());
+
+        for i in 0..100 {
+            stack.push(LinkedStackNode::new(i)).unwrap();
+        }
+
+        let stack_for_inspector = Arc::clone(&stack);
+        let inspector_handle = thread::spawn(move || {
+            let mut snapshot = Vec::new();
+            stack_for_inspector.inspect(|val| {
+                snapshot.push(val.clone());
+                thread::yield_now();
+            });
+            snapshot.len()
+        });
+
+        let mut handles = vec![];
+        for _ in 0..5 {
+            let s = Arc::clone(&stack);
+            handles.push(thread::spawn(move || {
+                for i in 0..100 {
+                    if i % 2 == 0 {
+                        let _ = s.push(LinkedStackNode::new(i));
+                    } else {
+                        let _ = s.pop();
+                    }
+                }
+            }));
+        }
+
+        let captured_len = inspector_handle.join().unwrap();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(captured_len >= 100);
     }
 
     #[test]
