@@ -52,13 +52,15 @@ impl<T> LinkedStack<T> {
 
     pub fn inspect<F>(&self, mut f: F)
     where
-        F: FnMut(&T),
+        F: FnMut(&T) -> bool,
     {
         self.inner.update_exclusive(|inner_ptr| {
             unsafe {
                 let mut current = inner_ptr.as_ref().unwrap().head;
                 while let Some(node_ptr) = current {
-                    f(&(*node_ptr).data);
+                    if !f(&(*node_ptr).data) {
+                        break;
+                    };
                     current = (*node_ptr).next;
                 }
             }
@@ -152,7 +154,10 @@ mod tests {
 
         stack.push(node1).unwrap();
 
-        stack.inspect(|f| assert_eq!(f.clone(), 10));
+        stack.inspect(|f| {
+            assert_eq!(f.clone(), 10);
+            return true;
+        });
     }
 
     #[test]
@@ -169,6 +174,7 @@ mod tests {
             stack_for_inspector.inspect(|val| {
                 snapshot.push(val.clone());
                 thread::yield_now();
+                return true;
             });
             snapshot.len()
         });
