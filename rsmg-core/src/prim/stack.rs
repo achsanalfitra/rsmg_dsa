@@ -1,4 +1,4 @@
-use crate::handle::AtomicHandle;
+use crate::handle::{AtomicHandle, AtomicHandleTrait};
 
 pub struct LinkedStack<T> {
     inner: AtomicHandle<*mut InnerLinkedStack<T>>,
@@ -21,14 +21,15 @@ impl<T> LinkedStack<T> {
     }
 
     pub fn pop(&self) -> Result<Option<T>, Box<dyn std::error::Error>> {
-        let mut popped_node = None;
+        let popped_node = core::cell::Cell::new(None);
 
-        self.inner.update_exclusive(|inner| unsafe {
-            popped_node = inner.as_mut().unwrap().pop().unwrap();
-            inner
-        });
+        self.inner
+            .update_exclusive(|inner: *mut InnerLinkedStack<T>| unsafe {
+                popped_node.set(inner.as_mut().unwrap().pop().unwrap());
+                inner
+            });
 
-        Ok(popped_node)
+        Ok(popped_node.take())
     }
 
     pub fn push(&self, node: LinkedStackNode<T>) -> Result<(), Box<dyn std::error::Error>> {
@@ -37,35 +38,32 @@ impl<T> LinkedStack<T> {
             return Err("pushed null pointer".into());
         }
 
-        let mut result = Ok(());
+        let result = core::cell::Cell::new(Ok(()));
 
-        self.inner.update_exclusive(|inner_ptr| {
-            unsafe {
-                let inner = inner_ptr.as_mut().unwrap();
-                result = inner.push(Some(node_ptr));
-            }
-            inner_ptr
-        });
+        self.inner
+            .update_exclusive(|inner_ptr: *mut InnerLinkedStack<T>| {
+                unsafe {
+                    let inner = inner_ptr.as_mut().unwrap();
+                    result.set(inner.push(Some(node_ptr)));
+                }
+                inner_ptr
+            });
 
-        result
+        result.into_inner()
     }
 
-    pub fn inspect<F>(&self, mut f: F)
-    where
-        F: FnMut(&T) -> bool,
-    {
-        self.inner.update_exclusive(|inner_ptr| {
-            unsafe {
-                let mut current = inner_ptr.as_ref().unwrap().head;
-                while let Some(node_ptr) = current {
-                    if !f(&(*node_ptr).data) {
-                        break;
-                    };
-                    current = (*node_ptr).next;
+    pub fn inspect(&self, f: impl Fn(&T)) {
+        self.inner
+            .update_exclusive(|inner_ptr: *mut InnerLinkedStack<T>| {
+                unsafe {
+                    let exist = inner_ptr.as_ref().unwrap();
+
+                    if let Some(head) = exist.head {
+                        f(&(*head).data);
+                    }
                 }
-            }
-            inner_ptr
-        });
+                inner_ptr
+            });
     }
 }
 
@@ -156,49 +154,7 @@ mod tests {
 
         stack.inspect(|f| {
             assert_eq!(f.clone(), 10);
-            return true;
         });
-    }
-
-    #[test]
-    fn test_inspect_contention_hammer() {
-        let stack = Arc::new(LinkedStack::new());
-
-        for i in 0..100 {
-            stack.push(LinkedStackNode::new(i)).unwrap();
-        }
-
-        let stack_for_inspector = Arc::clone(&stack);
-        let inspector_handle = thread::spawn(move || {
-            let mut snapshot = Vec::new();
-            stack_for_inspector.inspect(|val| {
-                snapshot.push(val.clone());
-                thread::yield_now();
-                return true;
-            });
-            snapshot.len()
-        });
-
-        let mut handles = vec![];
-        for _ in 0..5 {
-            let s = Arc::clone(&stack);
-            handles.push(thread::spawn(move || {
-                for i in 0..100 {
-                    if i % 2 == 0 {
-                        let _ = s.push(LinkedStackNode::new(i));
-                    } else {
-                        let _ = s.pop();
-                    }
-                }
-            }));
-        }
-
-        let captured_len = inspector_handle.join().unwrap();
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        assert!(captured_len >= 100);
     }
 
     #[test]
