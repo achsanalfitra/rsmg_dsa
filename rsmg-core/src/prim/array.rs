@@ -1,3 +1,5 @@
+use std::ptr::null;
+
 use crate::handle::{AtomicHandle, AtomicHandleTrait};
 extern crate alloc;
 use alloc::alloc::{Layout, alloc, dealloc, handle_alloc_error};
@@ -58,6 +60,18 @@ impl<T> ContiguousArray<T> {
                 inner_ptr
             });
     }
+
+    fn pop(&self) -> Result<Option<T>, Box<dyn std::error::Error>> {
+        let result = core::cell::Cell::new(Ok(None));
+
+        self.inner.update_exclusive(|inner| unsafe {
+            let popped_data = inner.as_mut().unwrap().pop();
+            result.set(popped_data);
+            inner
+        });
+
+        result.into_inner()
+    }
 }
 
 impl<T> InnerContiguousArray<T> {
@@ -97,6 +111,30 @@ impl<T> InnerContiguousArray<T> {
         }
     }
 
+    fn pop(&mut self) -> Result<Option<T>, Box<dyn std::error::Error>> {
+        if self.meta.length < 1 {
+            return Ok(None);
+        }
+
+        unsafe {
+            let base = self.address;
+            let top = base.add(self.meta.length - 1).read();
+
+            if top.is_null() {
+                return Ok(None);
+            }
+
+            self.meta.length -= 1;
+            let top_handle = Box::from_raw(top);
+            let (data_ptr, _) = top_handle.get();
+            let data = core::ptr::read(data_ptr);
+
+            drop(Box::from_raw(data_ptr));
+
+            return Ok(Some(data));
+        }
+    }
+
     fn reallocate(&mut self) {
         let layout =
             Layout::array::<*mut AtomicHandle<*mut T>>(self.meta.capacity * DEFAULT_MULTIPLIER)
@@ -125,6 +163,9 @@ impl<T> InnerContiguousArray<T> {
     }
 }
 
+unsafe impl<T: Copy + Send> Sync for ContiguousArray<T> {}
+unsafe impl<T: Copy + Send> Send for ContiguousArray<T> {}
+
 impl ContiguousArrayMetadata {
     fn new() -> Self {
         Self {
@@ -137,6 +178,8 @@ impl ContiguousArrayMetadata {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::prim::array::ContiguousArray;
 
     #[test]
@@ -154,5 +197,110 @@ mod tests {
         for _ in 0..10 {
             array.push(data);
         }
+    }
+
+    #[test]
+    fn test_push_pop_single() {
+        let array: ContiguousArray<usize> = ContiguousArray::new();
+        let data = 1;
+        array.push(data);
+
+        assert_eq!(array.pop().unwrap().unwrap(), data);
+    }
+
+    #[test]
+    fn test_push_pop_integrity() {
+        let array: ContiguousArray<usize> = ContiguousArray::new();
+
+        for i in 0..10 {
+            array.push(i);
+        }
+
+        for i in 0..10 {
+            assert_eq!(array.pop().unwrap().unwrap(), (9 - i));
+        }
+    }
+
+    #[test]
+    fn test_integrity_concurrent_push() {
+        let array = Arc::new(ContiguousArray::<usize>::new());
+        let mut handles = vec![];
+        let num_threads = 10;
+        let ops_per_thread = 1000;
+
+        for t in 0..num_threads {
+            let a = Arc::clone(&array);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..ops_per_thread {
+                    a.push(t * 10000 + i);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let mut results = vec![];
+        while let Ok(Some(val)) = array.pop() {
+            results.push(val);
+        }
+
+        // Verify total volume
+        assert_eq!(results.len(), num_threads * ops_per_thread);
+
+        // Verify per-thread LIFO integrity
+        for t in 0..num_threads {
+            let thread_prefix = t * 10000;
+            let mut thread_values: Vec<usize> = results
+                .iter()
+                .filter(|&&v| v >= thread_prefix && v < thread_prefix + 1000)
+                .cloned()
+                .collect();
+
+            let mut expected: Vec<usize> = (0..ops_per_thread)
+                .map(|i| thread_prefix + i)
+                .rev()
+                .collect();
+
+            // Values within a specific thread's context must be popped in reverse order
+            assert_eq!(thread_values, expected);
+        }
+    }
+
+    #[test]
+    fn test_concurrency_zero_sum_hammer() {
+        let array = Arc::new(ContiguousArray::<usize>::new());
+        let mut handles = vec![];
+        let num_threads = 10;
+        let ops_per_thread = 1000;
+
+        for t in 0..num_threads {
+            let a = Arc::clone(&array);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..ops_per_thread {
+                    if i % 2 == 0 {
+                        a.push(t * 1000 + i);
+                    } else {
+                        let _ = a.pop();
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Must be exactly zero because pushes == pops per thread
+        let mut final_count = 0;
+        while let Ok(Some(_)) = array.pop() {
+            final_count += 1;
+        }
+
+        assert_eq!(
+            final_count, 0,
+            "Stack leaked or corrupted during zero-sum hammer"
+        );
     }
 }
