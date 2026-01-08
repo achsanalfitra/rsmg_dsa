@@ -4,6 +4,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 static BEGIN_STAMP: u32 = 2;
 static WRITING_STATE: u32 = 1;
 
+pub(crate) trait AtomicHandleTrait<T: Copy> {
+    fn get(&self) -> (T, u32);
+    fn update(&self, f: impl Fn(T) -> T) -> T;
+    fn update_exclusive(&self, f: impl Fn(T) -> T) -> T;
+}
+
 enum STATE {
     Success,
     Stale,
@@ -15,89 +21,11 @@ pub(crate) struct AtomicHandle<T> {
     pub(crate) stamp: AtomicU32,
 }
 
-impl<T> AtomicHandle<T> {
+impl<T: Copy> AtomicHandle<T> {
     pub(crate) fn new(inner: T) -> Self {
         Self {
             inner: UnsafeCell::new(inner),
             stamp: AtomicU32::new(BEGIN_STAMP),
-        }
-    }
-
-    pub(crate) fn get(&self) -> (T, u32)
-    where
-        T: Copy,
-    {
-        loop {
-            let stamp = self.stamp.load(Ordering::Acquire);
-
-            if stamp == WRITING_STATE {
-                core::hint::spin_loop();
-                continue;
-            }
-
-            let inner = unsafe { *self.inner.get() };
-
-            let stamp_after = self.stamp.load(Ordering::Acquire);
-
-            if stamp == stamp_after {
-                return (inner, stamp);
-            }
-        }
-    }
-
-    pub(crate) fn update<F>(&self, mut f: F) -> T
-    where
-        F: FnMut(T) -> T,
-        T: Copy,
-    {
-        let (mut current_val, mut current_stamp) = self.get();
-
-        loop {
-            let next_val = f(current_val);
-
-            match self.swap(next_val, current_stamp) {
-                STATE::Success => break,
-
-                STATE::Busy => {
-                    core::hint::spin_loop();
-                    continue;
-                }
-
-                STATE::Stale => {
-                    core::hint::spin_loop();
-                    let (v, s) = self.get();
-                    current_val = v;
-                    current_stamp = s;
-                }
-            }
-        }
-
-        current_val
-    }
-
-    pub(crate) fn update_exclusive<F>(&self, mut f: F) -> T
-    where
-        F: FnMut(T) -> T,
-        T: Copy,
-    {
-        let (mut current_val, mut current_stamp) = self.get();
-
-        loop {
-            match self.write(current_val, current_stamp, &mut f) {
-                (data, STATE::Success) => return data,
-
-                (_, STATE::Busy) => {
-                    core::hint::spin_loop();
-                    continue;
-                }
-
-                (_, STATE::Stale) => {
-                    core::hint::spin_loop();
-                    let (v, s) = self.get();
-                    current_val = v;
-                    current_stamp = s;
-                }
-            }
         }
     }
 
@@ -126,10 +54,7 @@ impl<T> AtomicHandle<T> {
         STATE::Success
     }
 
-    fn write<F>(&self, inner: T, stamp: u32, mut f: F) -> (T, STATE)
-    where
-        F: FnMut(T) -> T,
-    {
+    fn write(&self, inner: T, stamp: u32, f: impl Fn(T) -> T) -> (T, STATE) {
         if self.stamp.load(Ordering::Acquire) == WRITING_STATE {
             return (inner, STATE::Busy);
         }
@@ -150,6 +75,75 @@ impl<T> AtomicHandle<T> {
             }
             _ => return (inner, STATE::Stale),
         };
+    }
+}
+
+impl<T: Copy> AtomicHandleTrait<T> for AtomicHandle<T> {
+    fn get(&self) -> (T, u32) {
+        loop {
+            let stamp = self.stamp.load(Ordering::Acquire);
+
+            if stamp == WRITING_STATE {
+                core::hint::spin_loop();
+                continue;
+            }
+
+            let inner = unsafe { *self.inner.get() };
+
+            let stamp_after = self.stamp.load(Ordering::Acquire);
+
+            if stamp == stamp_after {
+                return (inner, stamp);
+            }
+        }
+    }
+
+    fn update(&self, f: impl Fn(T) -> T) -> T {
+        let (mut current_val, mut current_stamp) = self.get();
+
+        loop {
+            let next_val = f(current_val);
+
+            match self.swap(next_val, current_stamp) {
+                STATE::Success => break,
+
+                STATE::Busy => {
+                    core::hint::spin_loop();
+                    continue;
+                }
+
+                STATE::Stale => {
+                    core::hint::spin_loop();
+                    let (v, s) = self.get();
+                    current_val = v;
+                    current_stamp = s;
+                }
+            }
+        }
+
+        current_val
+    }
+
+    fn update_exclusive(&self, f: impl Fn(T) -> T) -> T {
+        let (mut current_val, mut current_stamp) = self.get();
+
+        loop {
+            match self.write(current_val, current_stamp, &f) {
+                (data, STATE::Success) => return data,
+
+                (_, STATE::Busy) => {
+                    core::hint::spin_loop();
+                    continue;
+                }
+
+                (_, STATE::Stale) => {
+                    core::hint::spin_loop();
+                    let (v, s) = self.get();
+                    current_val = v;
+                    current_stamp = s;
+                }
+            }
+        }
     }
 }
 
