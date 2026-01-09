@@ -1,5 +1,3 @@
-use std::ptr::null;
-
 use crate::handle::{AtomicHandle, AtomicHandleTrait};
 extern crate alloc;
 use alloc::alloc::{Layout, alloc, dealloc, handle_alloc_error};
@@ -71,6 +69,86 @@ impl<T> ContiguousArray<T> {
         });
 
         result.into_inner()
+    }
+
+    fn len(&self) -> usize {
+        let result = core::cell::Cell::new(0usize);
+
+        self.inner.update(|inner| unsafe {
+            result.set(core::ptr::read(inner).len());
+            inner
+        });
+
+        result.into_inner()
+    }
+
+    fn get(&self, index: usize) -> Option<&T> {
+        let result = core::cell::Cell::new(None);
+        let element = core::cell::Cell::new(None);
+        let len = core::cell::Cell::new(0usize);
+
+        self.inner.update(|inner| unsafe {
+            len.set(inner.as_ref().unwrap().len());
+            inner
+        });
+
+        if len.into_inner() < index {
+            return None;
+        }
+
+        self.inner.update(|inner| unsafe {
+            element.set(inner.as_ref().unwrap().get(index));
+            inner
+        });
+
+        // look this now provide the read only data instead for convenience
+        // but the vision is there, the inner atomic handle is propped up
+        // then modified to have strong lock
+
+        unsafe {
+            element
+                .into_inner()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .update_exclusive(|element| {
+                    result.set(element.as_ref());
+                    element
+                });
+        }
+
+        result.into_inner()
+    }
+
+    fn inspect_element(&self, index: usize, f: impl Fn(&mut T)) {
+        let element = core::cell::Cell::new(None);
+        let len = core::cell::Cell::new(0usize);
+
+        self.inner.update(|inner| unsafe {
+            len.set(inner.as_ref().unwrap().len());
+            inner
+        });
+
+        if len.into_inner() < index {
+            return;
+        }
+
+        self.inner.update(|inner| unsafe {
+            element.set(inner.as_ref().unwrap().get(index));
+            inner
+        });
+
+        unsafe {
+            element
+                .into_inner()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .update_exclusive(|element| {
+                    f(&mut *element);
+                    element
+                });
+        }
     }
 }
 
@@ -159,7 +237,24 @@ impl<T> InnerContiguousArray<T> {
         }
 
         self.address = allocated_buffer;
+
         self.meta.capacity *= DEFAULT_MULTIPLIER;
+    }
+
+    fn len(&self) -> usize {
+        self.meta.length
+    }
+
+    fn get(&self, index: usize) -> Option<*mut AtomicHandle<*mut T>> {
+        // guarantee to exist
+
+        let base = self.address;
+
+        unsafe {
+            let target = base.add(index).read();
+            let target_handle = target.as_mut().unwrap();
+            Some(target_handle)
+        }
     }
 }
 
@@ -169,7 +264,7 @@ unsafe impl<T: Copy + Send> Send for ContiguousArray<T> {}
 impl ContiguousArrayMetadata {
     fn new() -> Self {
         Self {
-            length: DEFAULT_LENGTH,
+            length: 0,
             capacity: DEFAULT_CAPACITY,
             locker_count: 0,
         }
@@ -302,5 +397,135 @@ mod tests {
             final_count, 0,
             "Stack leaked or corrupted during zero-sum hammer"
         );
+    }
+
+    #[test]
+    fn test_concurrency_stable_read_hammer() {
+        let array = Arc::new(ContiguousArray::<usize>::new());
+        let num_readers = 12;
+        let entries = 10_000;
+
+        // --- PHASE 1: PUSH MANY FIRST ---
+        // Single-threaded or sequential push to establish ground truth data
+        // without triggering reallocation during the read phase.
+        for i in 0..entries {
+            array.push(i);
+        }
+
+        // Ensure the array actually has the data
+        assert_eq!(
+            array.len(),
+            entries,
+            "Array failed to initialize for hammer"
+        );
+
+        let mut handles = vec![];
+
+        // --- PHASE 2: CONCURRENCY READ HAMMER ---
+        // All threads hammering 'get' on a stable memory block.
+        // This tests if 'update_exclusive' handles the high-frequency
+        // "read-only reference" vision correctly.
+        for t in 0..num_readers {
+            let a = Arc::clone(&array);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..entries {
+                    // Stress different indices to ensure the pointer math
+                    // inside your 'inner' handle is consistent across threads.
+                    let target_idx = (i + t) % entries;
+
+                    if let Some(val_ref) = a.get(target_idx) {
+                        let val = *val_ref;
+
+                        // Verify the data is actually what we pushed
+                        // If this fails, the 'strong lock' is leaking state.
+                        assert_eq!(val, target_idx, "Data corruption at index {}", target_idx);
+
+                        std::hint::black_box(val);
+                    } else {
+                        panic!("Ground Truth Failure: Index {} should exist", target_idx);
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join()
+                .expect("Reader thread panicked - possible memory safety violation");
+        }
+
+        println!(
+            "Stable Read Hammer passed for {} concurrent readers.",
+            num_readers
+        );
+    }
+
+    #[test]
+    fn test_concurrency_element_rw_race_hammer() {
+        let array = Arc::new(ContiguousArray::<usize>::new());
+        let entries = 1000;
+        let ops_per_thread = 5000;
+
+        // Phase 1: Initialize with zeroed data
+        for _ in 0..entries {
+            array.push(0);
+        }
+
+        let mut handles = vec![];
+
+        // --- WRITER THREADS (The Mutators) ---
+        // These threads use inspect_element to increment values.
+        // This tests if the &mut T remains exclusive.
+        for _ in 0..4 {
+            let a = Arc::clone(&array);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..ops_per_thread {
+                    let idx = i % entries;
+                    a.inspect_element(idx, |val| {
+                        *val += 1;
+                    });
+                }
+            }));
+        }
+
+        // --- READER THREADS (The Observers) ---
+        // These threads use get() to read the values.
+        // They verify that they never see "torn" or garbage data.
+        for _ in 0..4 {
+            let a = Arc::clone(&array);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..ops_per_thread {
+                    let idx = i % entries;
+                    if let Some(val_ref) = a.get(idx) {
+                        let val = *val_ref;
+                        // In Alpha 1, we just ensure the read is safe/non-crashing.
+                        std::hint::black_box(val);
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join()
+                .expect("Race Hammer failed: Element-scoped lock violation");
+        }
+
+        // --- FINAL GROUND TRUTH CHECK ---
+        // Total sum should be (Writers * Ops)
+        let mut total_sum = 0;
+        for i in 0..entries {
+            if let Some(val) = array.get(i) {
+                total_sum += *val;
+            }
+        }
+
+        assert_eq!(
+            total_sum,
+            4 * ops_per_thread,
+            "Lost updates! Element-scoped locking is leaky. Expected {}, got {}",
+            4 * ops_per_thread,
+            total_sum
+        );
+
+        println!("Element RW Race Hammer passed. Total sum: {}", total_sum);
     }
 }
