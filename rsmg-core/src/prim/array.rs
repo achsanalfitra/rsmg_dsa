@@ -1,3 +1,6 @@
+use core::sync::atomic::{AtomicUsize, Ordering};
+use std::hint::spin_loop;
+
 use crate::handle::{AtomicHandle, AtomicHandleTrait};
 extern crate alloc;
 use alloc::alloc::{Layout, alloc, dealloc, handle_alloc_error};
@@ -5,6 +8,8 @@ use alloc::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 static DEFAULT_LENGTH: usize = 8 * size_of::<*mut u8>();
 static DEFAULT_CAPACITY: usize = 8 * size_of::<*mut u8>();
 static DEFAULT_MULTIPLIER: usize = 2;
+static WRITING_STATE: usize = 1;
+static FREE_STATE: usize = 2;
 
 struct ContiguousArray<T> {
     inner: AtomicHandle<*mut InnerContiguousArray<T>>,
@@ -18,9 +23,25 @@ struct InnerContiguousArray<T> {
 struct ContiguousArrayMetadata {
     length: usize,
     capacity: usize,
-    locker_count: usize,
+    locker_count: AtomicUsize,
+    resizing: AtomicUsize,
 }
-
+/// Rules of this impl:
+///
+/// Major ops include [`push`, `pop`] and many to come.
+/// By definition, major ops may resize and reallocate the address.
+/// This makes reading internal pointers dangerous.
+///
+/// Local ops are those that read internal pointers of this structure
+/// including [`get`, `inspect_element`].
+///
+/// The rule is that local ops only care about length.
+/// If length check succeeds, they increment locker_count by 1,
+/// perform their read, then decrement locker_count.
+///
+/// Major ops spin on locker_count. They wait until locker_count
+/// reaches zero before locking the whole structure through
+/// `update_exclusive`, then once done, release it.
 impl<T> ContiguousArray<T> {
     fn new() -> Self {
         let inner_array = InnerContiguousArray::<T>::new();
@@ -38,9 +59,8 @@ impl<T> ContiguousArray<T> {
 
         self.inner
             .update_exclusive(|inner_ptr: *mut InnerContiguousArray<T>| unsafe {
+                // This wins, when it enters
                 let inner = inner_ptr.as_mut().unwrap();
-                let current_length = inner.meta.length;
-                let current_capacity = inner.meta.capacity;
 
                 // this is currently not behaving like what I imagined
                 // the whole thing shouldn't be an update_exclusive()
@@ -50,11 +70,28 @@ impl<T> ContiguousArray<T> {
                 // when locker_count reaches 0
                 // we don't need any other metadata since
                 // massive operations are, by default, update_exclusive
-                if current_length + 1 > current_capacity {
-                    inner.reallocate();
+
+                // these only need to check for locker count before doing the operation
+
+                loop {
+                    if core::hint::black_box(inner.meta.locker_count.load(Ordering::Relaxed) > 0) {
+                        core::hint::spin_loop();
+                        continue;
+                    }
+
+                    let current_length = inner.meta.length;
+                    let current_capacity = inner.meta.capacity;
+
+                    inner.meta.resizing.store(WRITING_STATE, Ordering::SeqCst);
+                    if current_length + 1 > current_capacity {
+                        inner.reallocate();
+                    }
+
+                    inner.push(data_handle);
+                    inner.meta.resizing.store(FREE_STATE, Ordering::Release);
+                    break;
                 }
 
-                inner.push(data_handle);
                 inner_ptr
             });
     }
@@ -62,19 +99,53 @@ impl<T> ContiguousArray<T> {
     fn pop(&self) -> Result<Option<T>, Box<dyn std::error::Error>> {
         let result = core::cell::Cell::new(Ok(None));
 
-        self.inner.update_exclusive(|inner| unsafe {
-            let popped_data = inner.as_mut().unwrap().pop();
-            result.set(popped_data);
-            inner
-        });
+        self.inner
+            .update_exclusive(|inner_ptr: *mut InnerContiguousArray<T>| unsafe {
+                let inner = inner_ptr.as_mut().unwrap();
+
+                loop {
+                    // 1. Check for active inspectors
+                    if core::hint::black_box(inner.meta.locker_count.load(Ordering::Relaxed) > 0) {
+                        core::hint::spin_loop();
+                        continue;
+                    }
+
+                    // 2. Lock the state for massive operation
+                    inner.meta.resizing.store(WRITING_STATE, Ordering::SeqCst);
+
+                    // 3. Perform the actual pop
+                    // We do this inside the locker drain to ensure no one is
+                    // reading the tail element while we drop it.
+                    let popped_data = inner.pop();
+                    result.set(popped_data);
+
+                    // 4. Release the state
+                    inner.meta.resizing.store(FREE_STATE, Ordering::Release);
+                    break;
+                }
+
+                inner_ptr
+            });
 
         result.into_inner()
     }
 
+    // fn pop(&self) -> Result<Option<T>, Box<dyn std::error::Error>> {
+    //     let result = core::cell::Cell::new(Ok(None));
+
+    //     self.inner.update_exclusive(|inner| unsafe {
+    //         let popped_data = inner.as_mut().unwrap().pop();
+    //         result.set(popped_data);
+    //         inner
+    //     });
+
+    //     result.into_inner()
+    // }
+
     fn len(&self) -> usize {
         let result = core::cell::Cell::new(0usize);
 
-        self.inner.update(|inner| unsafe {
+        self.inner.update_exclusive(|inner| unsafe {
             result.set(core::ptr::read(inner).len());
             inner
         });
@@ -96,7 +167,14 @@ impl<T> ContiguousArray<T> {
             return None;
         }
 
+        // if the length check is done, I know that I am now a reader
         self.inner.update(|inner| unsafe {
+            inner
+                .as_mut()
+                .unwrap()
+                .meta
+                .locker_count
+                .fetch_add(1, Ordering::Acquire);
             element.set(inner.as_ref().unwrap().get(index));
             inner
         });
@@ -117,39 +195,102 @@ impl<T> ContiguousArray<T> {
                 });
         }
 
+        // give back the ordering
+        self.inner.update(|inner| unsafe {
+            inner
+                .as_mut()
+                .unwrap()
+                .meta
+                .locker_count
+                .fetch_sub(1, Ordering::Release);
+            inner
+        });
+
         result.into_inner()
     }
 
     fn inspect_element(&self, index: usize, f: impl Fn(&mut T)) {
-        let element = core::cell::Cell::new(None);
-        let len = core::cell::Cell::new(0usize);
+        self.inner
+            .update_exclusive(|inner_ptr: *mut InnerContiguousArray<T>| unsafe {
+                let inner = inner_ptr.as_mut().unwrap();
+                loop {
+                    // 1. Wait for massive operations (push/pop/reallocate) to finish intent
+                    if core::hint::black_box(
+                        inner.meta.resizing.load(Ordering::Acquire) == WRITING_STATE,
+                    ) {
+                        spin_loop();
+                        continue;
+                    }
 
-        self.inner.update(|inner| unsafe {
-            len.set(inner.as_ref().unwrap().len());
-            inner
-        });
+                    // 2. Register yourself as a reader
+                    inner.meta.locker_count.fetch_add(1, Ordering::SeqCst);
 
-        if len.into_inner() < index {
-            return;
-        }
+                    // 3. THE CRITICAL RE-CHECK: Now that we are pinned, is the index still valid?
+                    // A 'pop' could have finished right before we did the fetch_add.
+                    if index >= inner.meta.length {
+                        inner.meta.locker_count.fetch_sub(1, Ordering::SeqCst);
+                        return inner_ptr; // Early exit: index is now out of bounds
+                    }
 
-        self.inner.update(|inner| unsafe {
-            element.set(inner.as_ref().unwrap().get(index));
-            inner
-        });
+                    // 4. Access the element
+                    // We use .get(index) safely here because we verified index < length
+                    // while holding the locker_count pin.
+                    if let Some(handle_ptr) = inner.get(index) {
+                        handle_ptr.as_mut().unwrap().update_exclusive(|element| {
+                            f(&mut *element);
+                            element
+                        });
+                    }
 
-        unsafe {
-            element
-                .into_inner()
-                .unwrap()
-                .as_mut()
-                .unwrap()
-                .update_exclusive(|element| {
-                    f(&mut *element);
-                    element
-                });
-        }
+                    // 5. Unpin and finish
+                    inner.meta.locker_count.fetch_sub(1, Ordering::SeqCst);
+                    break;
+                }
+
+                inner_ptr
+            });
     }
+
+    // fn inspect_element(&self, index: usize, f: impl Fn(&mut T)) {
+    //     let len = core::cell::Cell::new(0usize);
+
+    //     self.inner.update(|inner| unsafe {
+    //         len.set(inner.as_ref().unwrap().len());
+    //         inner
+    //     });
+
+    //     if len.into_inner() < index {
+    //         return;
+    //     }
+
+    //     self.inner
+    //         .update_exclusive(|inner_ptr: *mut InnerContiguousArray<T>| unsafe {
+    //             let inner = inner_ptr.as_mut().unwrap();
+    //             loop {
+    //                 if core::hint::black_box(
+    //                     inner.meta.resizing.load(Ordering::Acquire) == WRITING_STATE,
+    //                 ) {
+    //                     spin_loop();
+    //                     continue;
+    //                 }
+
+    //                 inner.meta.locker_count.fetch_add(1, Ordering::SeqCst);
+    //                 inner
+    //                     .get(index)
+    //                     .unwrap()
+    //                     .as_mut()
+    //                     .unwrap()
+    //                     .update_exclusive(|element| {
+    //                         f(&mut *element);
+    //                         element
+    //                     });
+    //                 inner.meta.locker_count.fetch_sub(1, Ordering::SeqCst);
+    //                 break;
+    //             }
+
+    //             inner
+    //         });
+    // }
 }
 
 impl<T> InnerContiguousArray<T> {
@@ -266,7 +407,8 @@ impl ContiguousArrayMetadata {
         Self {
             length: 0,
             capacity: DEFAULT_CAPACITY,
-            locker_count: 0,
+            locker_count: AtomicUsize::new(0),
+            resizing: AtomicUsize::new(0),
         }
     }
 }
@@ -473,8 +615,6 @@ mod tests {
         let mut handles = vec![];
 
         // --- WRITER THREADS (The Mutators) ---
-        // These threads use inspect_element to increment values.
-        // This tests if the &mut T remains exclusive.
         for _ in 0..4 {
             let a = Arc::clone(&array);
             handles.push(std::thread::spawn(move || {
@@ -488,44 +628,332 @@ mod tests {
         }
 
         // --- READER THREADS (The Observers) ---
-        // These threads use get() to read the values.
-        // They verify that they never see "torn" or garbage data.
+        // Now using inspect_element for safe, non-torn reads.
         for _ in 0..4 {
             let a = Arc::clone(&array);
             handles.push(std::thread::spawn(move || {
                 for i in 0..ops_per_thread {
                     let idx = i % entries;
-                    if let Some(val_ref) = a.get(idx) {
-                        let val = *val_ref;
-                        // In Alpha 1, we just ensure the read is safe/non-crashing.
-                        std::hint::black_box(val);
-                    }
+                    // Reading through the same closure API to ensure atomicity
+                    a.inspect_element(idx, |val| {
+                        let data = *val;
+                        std::hint::black_box(data);
+                    });
                 }
             }));
         }
 
         for h in handles {
             h.join()
-                .expect("Race Hammer failed: Element-scoped lock violation");
+                .expect("Race Hammer failed: Element-scoped lock violation or Deadlock");
         }
 
         // --- FINAL GROUND TRUTH CHECK ---
-        // Total sum should be (Writers * Ops)
-        let mut total_sum = 0;
+        let total_sum = std::sync::atomic::AtomicUsize::new(0);
+
         for i in 0..entries {
-            if let Some(val) = array.get(i) {
-                total_sum += *val;
-            }
+            // We use a reference to the atomic so the closure can 'capture' it
+            // and perform the addition safely.
+            array.inspect_element(i, |val| {
+                total_sum.fetch_add(*val, std::sync::atomic::Ordering::SeqCst);
+            });
         }
 
+        let final_val = total_sum.load(std::sync::atomic::Ordering::SeqCst);
+
         assert_eq!(
-            total_sum,
+            final_val,
             4 * ops_per_thread,
             "Lost updates! Element-scoped locking is leaky. Expected {}, got {}",
             4 * ops_per_thread,
-            total_sum
+            final_val
         );
 
-        println!("Element RW Race Hammer passed. Total sum: {}", total_sum);
+        println!("Element RW Race Hammer passed. Total sum: {}", final_val);
+    }
+
+    #[test]
+    fn test_ghost_isolation_no_resizing() {
+        let array = Arc::new(ContiguousArray::<usize>::new());
+        let entries = 1000;
+        let ops_per_thread = 5000;
+
+        // Pre-allocate enough capacity so reallocate() is NEVER called during the test
+        // If this passes, the bug is 100% inside your reallocate/pop logic.
+        for _ in 0..entries {
+            array.push(0);
+        }
+
+        let mut handles = vec![];
+        for _ in 0..8 {
+            let a = Arc::clone(&array);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..ops_per_thread {
+                    a.inspect_element(i % entries, |val| {
+                        *val += 1;
+                    });
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let total = get_total_sum_atomic(&array, entries);
+        assert_eq!(
+            total,
+            8 * ops_per_thread,
+            "Ghost found even WITHOUT resizing! The issue is in inspect_element itself."
+        );
+    }
+
+    fn get_total_sum_atomic(array: &ContiguousArray<usize>, entries: usize) -> usize {
+        let sum = std::sync::atomic::AtomicUsize::new(0);
+        for i in 0..entries {
+            array.inspect_element(i, |val| {
+                sum.fetch_add(*val, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        sum.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn test_pointer_aliasing_signature() {
+        let array = Arc::new(ContiguousArray::<usize>::new());
+        let entries = 100;
+
+        // Give every index a massive unique signature
+        for i in 0..entries {
+            array.push(i * 1_000_000);
+        }
+
+        // Hammer increments
+        let a = Arc::clone(&array);
+        let handle = std::thread::spawn(move || {
+            for _ in 0..1000 {
+                a.inspect_element(5, |val| *val += 1);
+            }
+        });
+        handle.join().unwrap();
+
+        // Verify signatures
+        for i in 0..entries {
+            array.inspect_element(i, |val| {
+                let expected_base = i * 1_000_000;
+                if i == 5 {
+                    assert_eq!(*val, expected_base + 1000);
+                } else {
+                    // If this fails, Index 5's increment "leaked" into Index i
+                    assert_eq!(*val, expected_base, "Aliasing detected at Index {}", i);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn test_metadata_consistency_hammer() {
+        let array = Arc::new(ContiguousArray::<usize>::new());
+        array.push(0);
+
+        let a1 = Arc::clone(&array);
+        let h1 = std::thread::spawn(move || {
+            for _ in 0..100_000 {
+                // Simulate an inspector
+                a1.inspect_element(0, |v| {
+                    std::hint::black_box(*v);
+                });
+            }
+        });
+
+        let a2 = Arc::clone(&array);
+        let h2 = std::thread::spawn(move || {
+            for _ in 0..1000 {
+                // Simulate a massive op (push/reallocate)
+                a2.push(1);
+            }
+        });
+
+        h1.join().unwrap();
+        h2.join().unwrap();
+        // If the internal assertions or spin-loops didn't deadlock/crash,
+        // metadata consistency is likely okay.
+    }
+
+    #[test]
+    fn test_contiguous_array_push_pop_integrity_hammer() {
+        let array = Arc::new(ContiguousArray::<usize>::new());
+        let initial_count = 100;
+        let ops = 5000;
+
+        // Phase 1: Seed the array with recognizable data
+        for i in 0..initial_count {
+            array.push(i);
+        }
+
+        let mut handles = vec![];
+
+        // --- THE CHURN THREAD (Push & Pop) ---
+        // This thread triggers reallocations and memory frees constantly.
+        let churn_array = Arc::clone(&array);
+        handles.push(std::thread::spawn(move || {
+            for i in 0..ops {
+                // Alternating push and pop to keep the array "shaking"
+                churn_array.push(i + 1000);
+                let _ = churn_array.pop();
+            }
+        }));
+
+        // --- THE VERIFIER THREADS ---
+        // These threads check that the "base" data (indices 0..50) never changes.
+        // If reallocate is leaky, these will read garbage or crash.
+        for _ in 0..3 {
+            let verify_array = Arc::clone(&array);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..ops {
+                    // We pick a stable index that isn't being popped
+                    let target_idx = 10;
+                    verify_array.inspect_element(target_idx, |val| {
+                        // Index 10 was initialized to 10. It should STAY 10.
+                        assert_eq!(*val, 10, "Memory corruption detected during push/pop!");
+                    });
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join()
+                .expect("Hammer failed! Possible Use-After-Free or Data Race.");
+        }
+
+        println!("Integrity Hammer passed: Data remained stable during heavy churn.");
+    }
+
+    #[test]
+    fn test_rapid_growth() {
+        let array = Arc::new(ContiguousArray::<usize>::new());
+        let mut handles = vec![];
+        let threads = 10;
+        let ops_per_thread = 1000;
+
+        for t in 0..threads {
+            let a = Arc::clone(&array);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..ops_per_thread {
+                    // Testing high-frequency pushes to trigger DEFAULT_MULTIPLIER jumps
+                    a.push(t * 100000 + i);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("Thread panicked during rapid growth");
+        }
+
+        // Verify total count matches total pushes
+        assert_eq!(array.len(), threads * ops_per_thread);
+
+        // Verify no corruption by draining the array
+        let mut pop_count = 0;
+        while let Some(_) = array.pop().expect("Pop error") {
+            pop_count += 1;
+        }
+
+        assert_eq!(pop_count, threads * ops_per_thread);
+        println!(
+            "Rapid growth passed: {} elements pushed and verified.",
+            pop_count
+        );
+    }
+
+    #[test]
+    fn test_concurrent_inspect_same_index() {
+        let array = Arc::new(ContiguousArray::<usize>::new());
+        array.push(0); // Initialize slot 0
+
+        let mut handles = vec![];
+        let threads = 10;
+        let ops_per_thread = 1000;
+
+        for _ in 0..threads {
+            let a = Arc::clone(&array);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..ops_per_thread {
+                    // Both array lock and element lock are stressed here
+                    a.inspect_element(0, |val| {
+                        *val += 1;
+                    });
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("Thread panicked during concurrent inspect");
+        }
+
+        let expected = threads * ops_per_thread;
+        array.inspect_element(0, |val| {
+            assert_eq!(
+                *val, expected,
+                "Lost updates! Expected {} but got {}. Element lock is leaky.",
+                expected, *val
+            );
+        });
+    }
+
+    #[test]
+    fn test_inspect_during_pop_of_same_index() {
+        let array = Arc::new(ContiguousArray::<usize>::new());
+        let target_idx = 9;
+        let ops = 50;
+
+        for i in 0..=target_idx {
+            array.push(i);
+        }
+
+        let mut handles = vec![];
+
+        // --- THE CHURNER ---
+        let pop_array = Arc::clone(&array);
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..ops {
+                // Constantly shrinking and growing the boundary
+                let _ = pop_array.pop();
+                pop_array.push(99999);
+            }
+        }));
+
+        // --- THE BOUNDARY INSPECTORS ---
+        for _ in 0..3 {
+            let inspect_array = Arc::clone(&array);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..ops {
+                    let current_len = inspect_array.len();
+                    if current_len == 0 {
+                        continue;
+                    }
+
+                    let try_idx = current_len - 1;
+
+                    // inspect_element should either run safely or return early via the bounds check
+                    inspect_array.inspect_element(try_idx, |val| {
+                        let v = *val;
+                        let is_valid = v <= target_idx || v == 99999;
+                        assert!(is_valid, "Corrupt read at index {}: {}", try_idx, v);
+                    });
+
+                    // Validate explicit bounds protection
+                    // (Assuming inspect_element returns early for indices >= len)
+                    inspect_array.inspect_element(1000000, |_| {
+                        panic!("Boundary check failed: Inspected index far beyond len");
+                    });
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join()
+                .expect("Integrity failure: Race between inspect and pop/push");
+        }
     }
 }
