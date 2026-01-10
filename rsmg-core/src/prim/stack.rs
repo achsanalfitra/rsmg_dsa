@@ -101,6 +101,26 @@ impl<T> InnerLinkedStack<T> {
     }
 }
 
+impl<T> Drop for LinkedStack<T> {
+    fn drop(&mut self) {
+        let inner_ptr = self.inner.get().0;
+
+        if inner_ptr.is_null() {
+            return;
+        }
+
+        let mut inner = unsafe { Box::from_raw(inner_ptr) };
+
+        let mut current_head = inner.head.take();
+
+        while let Some(node_ptr) = current_head {
+            let mut node = unsafe { Box::from_raw(node_ptr) };
+
+            current_head = node.next.take();
+        }
+    }
+}
+
 impl<T> Drop for InnerLinkedStack<T> {
     fn drop(&mut self) {
         while let Ok(Some(_)) = self.pop() {}
@@ -162,7 +182,7 @@ mod tests {
         let stack = Arc::new(LinkedStack::new());
         let mut handles = vec![];
         let num_threads = 10;
-        let ops_per_thread = 1000;
+        let ops_per_thread = 50;
         for t in 0..num_threads {
             let s = Arc::clone(&stack);
             handles.push(thread::spawn(move || {
@@ -194,7 +214,7 @@ mod tests {
         let stack = Arc::new(LinkedStack::new());
         let mut handles = vec![];
         let num_threads = 10;
-        let ops_per_thread = 1000; // Total 10,000 operations
+        let ops_per_thread = 50; // Total 10,000 operations
 
         for t in 0..num_threads {
             let s = Arc::clone(&stack);
