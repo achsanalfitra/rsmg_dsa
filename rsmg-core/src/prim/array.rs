@@ -201,11 +201,14 @@ impl<T> ContiguousArray<T> {
                     return Ok(None);
                 }
 
-                (*inner_ptr).meta.length.fetch_sub(1, Ordering::Release);
+                // do not sub yet if there are lingering readers
+                // (*inner_ptr).meta.length.fetch_sub(1, Ordering::Release);
 
                 while (*inner_ptr).meta.locker_count.load(Ordering::Acquire) > 0 {
                     core::hint::spin_loop();
                 }
+
+                (*inner_ptr).meta.length.fetch_sub(1, Ordering::Release);
 
                 (*inner_ptr)
                     .meta
