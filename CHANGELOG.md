@@ -15,3 +15,6 @@
 * Notes
  * Unsafe code paths are Miri-verified
  * APIs are structured to prevent misuse (no manual lock/unlock)
+
+* HOTPATCH
+ * Remove Copy trait bound

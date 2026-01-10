@@ -472,8 +472,8 @@ impl<T> Drop for InnerContiguousArray<T> {
         }
     }
 }
-unsafe impl<T: Copy + Send> Sync for ContiguousArray<T> {}
-unsafe impl<T: Copy + Send> Send for ContiguousArray<T> {}
+unsafe impl<T: Send> Sync for ContiguousArray<T> {}
+unsafe impl<T: Send> Send for ContiguousArray<T> {}
 
 impl ContiguousArrayMetadata {
     fn new() -> Self {
@@ -488,9 +488,69 @@ impl ContiguousArrayMetadata {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
 
     use crate::prim::array::ContiguousArray;
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct TestStruct {
+        id: String,
+        text: String,
+        class: String,
+    }
+
+    #[test]
+    fn test_concurrency_full_cycle() {
+        // 1. Setup: Use Arc to share the array across threads
+        let array = Arc::new(ContiguousArray::<TestStruct>::new());
+        let num_readers = 4;
+        let num_writers = 2;
+        let iterations = 100;
+
+        let start_barrier = Arc::new(Barrier::new(num_readers + num_writers));
+        let mut handles = Vec::new();
+
+        for i in 0..num_readers {
+            let array = Arc::clone(&array);
+            let barrier = Arc::clone(&start_barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..iterations {
+                    array.inspect_element(0, |item| {
+                        assert!(!item.id.is_empty());
+                    });
+                }
+            }));
+        }
+
+        // 3. Spawn Writers: They Push and Pop
+        for i in 0..num_writers {
+            let array = Arc::clone(&array);
+            let barrier = Arc::clone(&start_barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for j in 0..iterations {
+                    let data = TestStruct {
+                        id: format!("id-{}-{}", i, j),
+                        text: "Hello from Thread".to_string(),
+                        class: "btn-primary".to_string(),
+                    };
+
+                    array.push(data);
+                    std::thread::yield_now();
+                    array.pop();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("Thread panicked! Possible race condition detected.");
+        }
+
+        assert_eq!(array.len(), 0);
+    }
 
     #[test]
     fn test_simple_push() {
